@@ -466,6 +466,87 @@ def test_live_path() -> None:
           decision.action in ("enter", "hold"))
 
 
+def test_live_path_regressions() -> None:
+    """Regressions from the real live session, each of which passed the suite before.
+
+    These three shipped and were only caught by running against the real venue:
+    a KeyError that killed the process, a double-oriented imbalance that silently
+    inverted every DOWN trade, and a decision that fired 1.2s before its target.
+    """
+    section("8. LIVE-SESSION REGRESSIONS")
+
+    # --- the KeyError: a decision for a window that was never observed ---------
+    fresh = SessionRecorder(300.0)
+    try:
+        cap = fresh.mark_decision("btc-updown-5m-1791696900", 0.75, None, 0.78, 0.01)
+        ok, detail = True, "window created on demand"
+    except KeyError as exc:
+        cap, ok, detail = None, False, f"KeyError {exc}"
+    check("a decision for an unobserved window does not raise", ok, detail)
+    check("the unobserved window records NO open rather than a substituted one",
+          cap is not None and cap.open_up_mid is None and cap.open_lag_s is None)
+    check("the epoch is recovered from the slug",
+          cap is not None and cap.epoch == 1791696900
+          and cap.start_ts == 1791696900.0, f"{cap.epoch if cap else None}")
+    check("the window is still marked decided", cap is not None and cap.decided)
+
+    # --- the double-orientation -------------------------------------------------
+    # The gate tests |imbalance|, so pre-orienting does NOT change the decision - an
+    # earlier version of this test asserted that it did, and was wrong. What it
+    # changes is the SIGN STORED IN THE LEDGER, which is the evidence a live session
+    # is judged on. So the assertion is about the recorded value, not the outcome.
+    params = V6Params()
+    raw_up_space = -0.60            # DOWN token book bid-heavy, in UP-token space
+    correct = StrategyV6(params)
+    correct.evaluate(
+        slug="d", now=1.0, secs_to_close=params.entry_t_minus,
+        up_mid_open=0.60, up_mid_now=0.30,           # a fall -> buy DOWN
+        book_imbalance=raw_up_space,                 # RAW, as the live loop now passes
+        spot_open=100.0, spot_now=99.0, ask=0.70, spread=0.01,
+        quote_ts=1.0, shares_wanted=14.0, depth_cost=9.8)
+    right = correct.ledger.readings[-1].book_imbalance
+    check("a RAW imbalance is oriented once, to +0.60 for a DOWN buy",
+          right is not None and abs(right - 0.60) < 1e-9, f"{right}")
+
+    doubled = StrategyV6(params)
+    doubled.evaluate(
+        slug="d2", now=1.0, secs_to_close=params.entry_t_minus,
+        up_mid_open=0.60, up_mid_now=0.30,
+        book_imbalance=+0.60,                        # pre-flipped = the old live bug
+        spot_open=100.0, spot_now=99.0, ask=0.70, spread=0.01,
+        quote_ts=1.0, shares_wanted=14.0, depth_cost=9.8)
+    wrong = doubled.ledger.readings[-1].book_imbalance
+    check("double-orienting records the WRONG sign in the ledger",
+          wrong is not None and wrong < 0, f"{wrong}")
+    check("the two disagree, so the live loop had to stop pre-orienting",
+          right is not None and wrong is not None and right * wrong < 0,
+          f"{right} vs {wrong}")
+
+    # and the gate must still be on magnitude: the anti-correlated book is accepted
+    moved = StrategyV6(params).evaluate(
+        slug="d3", now=1.0, secs_to_close=params.entry_t_minus,
+        up_mid_open=0.60, up_mid_now=0.30, book_imbalance=-0.60,
+        spot_open=100.0, spot_now=99.0, ask=0.70, spread=0.01,
+        quote_ts=1.0, shares_wanted=14.0, depth_cost=9.8)
+    check("the gate is on magnitude, matching the validated calibration",
+          moved.entering, f"{moved.reason}")
+    check("a small imbalance is still refused regardless of sign",
+          not StrategyV6(params).evaluate(
+              slug="d4", now=1.0, secs_to_close=params.entry_t_minus,
+              up_mid_open=0.60, up_mid_now=0.30, book_imbalance=0.10,
+              spot_open=100.0, spot_now=99.0, ask=0.70, spread=0.01,
+              quote_ts=1.0, shares_wanted=14.0, depth_cost=9.8).entering)
+
+    # --- the wake budget: the decision must not fire before its target ---------
+    import run_live_v6 as live
+    check("time is reserved for the book fetch",
+          live.BOOK_FETCH_BUDGET_S > 0.5,
+          f"{live.BOOK_FETCH_BUDGET_S}s reserved")
+    check("the wake slack exceeds the fetch budget",
+          live.WAKE_SLACK_S > live.BOOK_FETCH_BUDGET_S,
+          f"slack {live.WAKE_SLACK_S}s > budget {live.BOOK_FETCH_BUDGET_S}s")
+
+
 def main() -> int:
     print("=" * 92)
     print("V6 TEST SUITE - no network, no dataset, no side effects")
@@ -477,6 +558,7 @@ def main() -> int:
     test_recorder()
     test_spot_tracker()
     test_live_path()
+    test_live_path_regressions()
     section(f"RESULT: {CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     for failure in FAILURES:
         print(f"  - {failure}")

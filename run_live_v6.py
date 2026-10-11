@@ -62,6 +62,13 @@ from engine_v6.strategy import (  # noqa: E402
 
 DEFAULT_LOG_DIR = os.path.join(PKG, "paper_v6")
 
+#: How early to start the decision sequence, relative to the target second.
+WAKE_SLACK_S = 2.5
+#: Time reserved for the book fetch that must complete BY the target second.
+#: A public REST round trip measured 0.6-1.2s in the live session, so the wake has to
+#: lead the target by at least this much or the trade is taken too early.
+BOOK_FETCH_BUDGET_S = 1.5
+
 DECISION_FIELDS = [
     "decided_at_utc", "slug", "secs_to_close", "action", "reason", "side",
     "up_mid_open", "up_mid_now", "move", "open_lag_s",
@@ -286,11 +293,16 @@ def cmd_run(params: V6Params, stake: float, log_dir: str, seconds: float,
                 continue
 
             # --- approach the decision instant, then decide once -------------
+            # The decision needs a book fetch BEFORE the target second, and that
+            # fetch costs several hundred milliseconds. The old code allowed only
+            # 0.6s of slack, so the observed decision landed 1.2s EARLY - buying a
+            # higher ask than the checkpoint the strategy was calibrated on. Since
+            # the entry price is the entire edge, that is not a rounding detail.
+            # Wake early enough for the fetch to finish at the target.
             target_close = params.entry_t_minus
-            if slug not in decided and secs_to_close <= target_close + 0.6:
-                # sleep the remainder, capped, so the wake lands inside the target
-                wake_in = max(0.0, secs_to_close - target_close)
-                if wake_in > 0.05:
+            if slug not in decided and secs_to_close <= target_close + WAKE_SLACK_S:
+                wake_in = secs_to_close - target_close - BOOK_FETCH_BUDGET_S
+                if wake_in > 0.02:
                     time.sleep(min(wake_in, 0.5))
                     continue
                 decided.add(slug)
@@ -343,24 +355,28 @@ def _decide_and_log(strategy: StrategyV6, feed: PolymarketFeed, tracker: SpotTra
         pass
 
     open_point = tracker.at(market.start_ts) if market.start_ts else None
-    if open_point is None and cap is not None:
-        # fall back to the mid observed by the loop, which carries its own lag
-        spot_open = None
-    else:
-        spot_open = open_point.price if open_point else None
+    spot_open = open_point.price if open_point else None
     now_point = tracker.at(decided_at, tolerance=max(2.0, tracker.interval * 4))
     spot_now = now_point.price if now_point else None
+    # say so when the spot pair is incomplete, because the spot gate is SKIPPED
+    # silently in that case and the window would otherwise look gate-compliant
+    spot_incomplete = open_point is None or now_point is None
+    if spot_incomplete:
+        print(f"  [{utc(decided_at)}] {slug}: SPOT PAIR INCOMPLETE "
+              f"(open={'ok' if open_point else 'MISSING'} "
+              f"now={'ok' if now_point else 'MISSING'}) - spot gate not applied")
 
     cap = recorder.windows.get(slug)
     up_mid_open = cap.open_up_mid if cap else None
     up_mid_now = book.mid if ask is not None else None
-    signed_imb = None
+    # RAW imbalance, not oriented. The strategy orients it itself, using the same
+    # direction call that produces the trade. Orienting here as well flipped the sign
+    # a SECOND time for every DOWN trade, which inverted the value the gate tested:
+    # a genuinely lopsided book (+0.5) read as -0.5 and was refused, while a balanced
+    # book could read as lopsided and be accepted. Every DOWN trade was affected.
+    raw_imbalance = None
     if cap and ask is not None:
-        raw = cap.imbalances.get(str(params.imbalance_depth))
-        if raw is not None and up_mid_open is not None and up_mid_now is not None:
-            move = up_mid_now - up_mid_open
-            side = "UP" if move > 0 else "DOWN"
-            signed_imb = strategy.orient(raw, side)
+        raw_imbalance = cap.imbalances.get(str(params.imbalance_depth))
 
     shares = stake / ask if ask else 0.0
     depth_cost = None
@@ -372,7 +388,7 @@ def _decide_and_log(strategy: StrategyV6, feed: PolymarketFeed, tracker: SpotTra
         slug=slug, now=decided_at,
         secs_to_close=market.end_ts - decided_at,
         up_mid_open=up_mid_open, up_mid_now=up_mid_now,
-        book_imbalance=signed_imb,
+        book_imbalance=raw_imbalance,
         bid_notional=cap.notionals.get(f"bid_{params.imbalance_depth}") if cap else None,
         ask_notional=cap.notionals.get(f"ask_{params.imbalance_depth}") if cap else None,
         bid_depth=book.bid_depth, ask_depth=book.ask_depth,

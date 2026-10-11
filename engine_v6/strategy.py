@@ -287,6 +287,12 @@ class StrategyV6:
             return Decision("hold", NO_MOVE, move=move or 0.0)
 
         signed = self.orient(book_imbalance, side)
+        # The gate is on the MAGNITUDE, matching the calibration that produced the
+        # validated backtest. A sign test was tried and had to be reverted; see the
+        # note at the end of this method for what the data actually showed.
+        if signed is not None and not (-1.0 <= signed <= 1.0):
+            # out of range means the caller passed something that is not an imbalance
+            return Decision("hold", BALANCED_BOOK, side=side, move=move or 0.0)
         if signed is not None and abs(signed) < p.min_book_imbalance:
             return Decision("hold", BALANCED_BOOK, side=side, move=move or 0.0)
         if spot_move is not None and abs(spot_move) < p.min_spot_move:
@@ -317,6 +323,38 @@ class StrategyV6:
         return Decision("enter", READY, side=side, move=move or 0.0,
                         limit_price=entry, shares=shares_wanted,
                         break_even=break_even)
+
+    # ------------------------------------------------------------------------
+    # OPEN QUESTION: WHAT DOES THE IMBALANCE SIGN MEAN HERE?
+    #
+    # This gate tests |imbalance|, so the sign never reaches the decision. Adding a
+    # sign test was attempted and reverted, because the measurement came out inverted
+    # from the natural reading:
+    #
+    #   UP trades, raw imbalance > 0 (bid-heavy on the UP token): 71.9% win (n=114)
+    #   UP trades, raw imbalance < 0 (ask-heavy on the UP token): 79.2% win (n=1555)
+    #   DOWN trades, raw > 0: 74.2% win      DOWN trades, raw < 0: 79.7% win
+    #
+    # Two things follow, and both matter:
+    #
+    # 1. The sign runs OPPOSITE to the natural reading of \`full_depth_bid_notional\`,
+    #    OR that column is not the UP token's book at all. Bid-heavy on the UP token
+    #    is associated with a LOWER Up win rate, not a higher one.
+    # 2. Being on the "right" side of the sign is worth only a few points, and the
+    #    large majority of trades (1,555 of 1,669) sit on the negative side. So the
+    #    sign is NOT what carries the edge - which also means the double-orientation
+    #    bug in the live loop changed the recorded ledger value without changing any
+    #    decision, because |imbalance| was tested either way.
+    #
+    # Requiring signed >= 0 refused every window in the dataset, which is how this was
+    # found. Flipping the sign to match the measurement would fit 1,669 observations
+    # on one dataset, i.e. exactly the overfitting this project already suffered from
+    # once. So the gate stays on magnitude pending an out-of-sample test, and the
+    # question is recorded as open rather than silently answered.
+    #
+    # Consequence to keep in mind: the "book imbalance is THE EDGE" story is weaker
+    # than earlier rounds claimed. The move gate looks like the real driver.
+    # ------------------------------------------------------------------------
 
     # ------------------------------------------------------------- reporting
     def describe(self) -> list[str]:

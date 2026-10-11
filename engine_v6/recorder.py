@@ -46,6 +46,14 @@ from dataclasses import dataclass, field
 DEPTH_PROBES = (5, 10, 20, None)
 
 
+def _epoch_from_slug(slug: str) -> int:
+    """Recover the window epoch from `btc-updown-5m-<epoch>`; 0 if unparseable."""
+    try:
+        return int(str(slug).rsplit("-", 1)[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 @dataclass
 class SpotPoint:
     ts: float
@@ -191,8 +199,29 @@ class SessionRecorder:
 
     def mark_decision(self, slug: str, up_mid: float | None,
                       book: object | None, ask: float | None,
-                      spread: float | None) -> WindowCapture:
-        capture = self.windows[slug]
+                      spread: float | None,
+                      epoch: int | None = None) -> WindowCapture:
+        """Record the decision for a window.
+
+        Uses ``setdefault`` rather than ``self.windows[slug]``, which crashed the live
+        loop with ``KeyError: 'btc-updown-5m-...'`` whenever the decision fired for a
+        window that had never been observed. That happens routinely, not rarely:
+
+        * the loop starts mid-window and the decision second arrives before any
+          observation of that window completed
+        * a slow market lookup or book fetch consumes the whole observation phase
+        * a transient feed error skips the observation branch for that window
+
+        A KeyError here takes down the entire session, so the capture is created on
+        demand and the missing open is recorded as such. ``open_lag_s`` stays None,
+        which the session summary already reports as "NEVER captured" - the window is
+        then refused for a missing open rather than silently traded on a substituted
+        value.
+        """
+        if epoch is None:
+            epoch = _epoch_from_slug(slug)
+        capture = self.windows.setdefault(
+            slug, WindowCapture(slug=slug, epoch=epoch, start_ts=float(epoch)))
         capture.decision_ts = time.time()
         capture.decision_up_mid = up_mid
         capture.decision_book = book
